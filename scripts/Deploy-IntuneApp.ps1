@@ -1,8 +1,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ── 0. Bootstrap ──────────────────────────────────────────────────────────────
-
 Write-Host "--- 0. Bootstrap ---"
 
 $requiredEnv = @("APP_NAME","APP_VERSION","INSTALL_CMD","UNINSTALL_CMD","INTUNEWIN_PATH")
@@ -32,7 +30,6 @@ Write-Host "App Version : $appVersion"
 Write-Host "Package     : $pkgPath ($([math]::Round((Get-Item $pkgPath).Length/1MB,2)) MB)"
 Write-Host "Force Update: $forceUpdate"
 
-# Install modules
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 foreach ($mod in @("IntuneWin32App","Microsoft.Graph.Authentication")) {
@@ -43,8 +40,6 @@ foreach ($mod in @("IntuneWin32App","Microsoft.Graph.Authentication")) {
 }
 Import-Module IntuneWin32App -Force
 Import-Module Microsoft.Graph.Authentication -Force
-
-# ── 1. Authenticate via OIDC ──────────────────────────────────────────────────
 
 Write-Host "--- 1. Authenticate (OIDC) ---"
 
@@ -57,20 +52,22 @@ catch {
     exit 1
 }
 
-# Convert SecureString to plain text for IntuneWin32App module
+# Convert SecureString to plain text
 $plainToken = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
     [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenObj.Token)
 )
 
-# Connect Microsoft.Graph (for Invoke-MgGraphRequest)
+# Connect Microsoft.Graph for Invoke-MgGraphRequest
 Connect-MgGraph -AccessToken $tokenObj.Token -NoWelcome
 Write-Host "Connected to Microsoft Graph"
 
-# Connect IntuneWin32App module (uses its own auth context)
-Connect-MSIntuneGraph -AccessToken $plainToken
-Write-Host "Connected to MSIntuneGraph"
-
-# ── 2. Check existing app ─────────────────────────────────────────────────────
+# Set global auth header for IntuneWin32App module (bypasses Connect-MSIntuneGraph)
+$global:AuthenticationHeader = @{
+    "Content-Type" = "application/json"
+    "Authorization" = "Bearer $plainToken"
+    "ExpiresOn"    = $tokenObj.ExpiresOn.ToString()
+}
+Write-Host "IntuneWin32App auth header set"
 
 Write-Host "--- 2. Check existing app ---"
 
@@ -88,8 +85,6 @@ if ($existingApp) {
 } else {
     Write-Host "App not found - will create new."
 }
-
-# ── 3. Detection rule ─────────────────────────────────────────────────────────
 
 Write-Host "--- 3. Build detection rule ---"
 
@@ -126,8 +121,6 @@ $detectionRule = switch ($detectCfg.type) {
     }
 }
 
-# ── 4. Requirement rules ──────────────────────────────────────────────────────
-
 Write-Host "--- 4. Build requirement rules ---"
 
 $req = $configRaw.requirements
@@ -143,8 +136,6 @@ $reqRules = @(
         -MinimumSupportedWindowsRelease $minOs `
         -Architecture $req.architecture
 )
-
-# ── 5. Create or Update ───────────────────────────────────────────────────────
 
 Write-Host "--- 5. Create / Update app ---"
 
@@ -194,8 +185,6 @@ else {
     $appId = $newApp.id
 }
 
-# ── 6. Assign to All Devices ──────────────────────────────────────────────────
-
 Write-Host "--- 6. Assign to All Devices ---"
 
 $assignments   = Get-IntuneWin32AppAssignment -ID $appId -ErrorAction SilentlyContinue
@@ -211,8 +200,6 @@ if ($hasAllDevices -and -not $forceUpdate) {
         -Notification "showAll"
     Write-Host "Assigned to All Devices (Required)"
 }
-
-# ── 7. Summary ────────────────────────────────────────────────────────────────
 
 Write-Host "DEPLOYMENT COMPLETE"
 Write-Host "App       : $appName"
