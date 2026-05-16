@@ -57,8 +57,18 @@ catch {
     exit 1
 }
 
+# Convert SecureString to plain text for IntuneWin32App module
+$plainToken = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenObj.Token)
+)
+
+# Connect Microsoft.Graph (for Invoke-MgGraphRequest)
 Connect-MgGraph -AccessToken $tokenObj.Token -NoWelcome
 Write-Host "Connected to Microsoft Graph"
+
+# Connect IntuneWin32App module (uses its own auth context)
+Connect-MSIntuneGraph -AccessToken $plainToken
+Write-Host "Connected to MSIntuneGraph"
 
 # ── 2. Check existing app ─────────────────────────────────────────────────────
 
