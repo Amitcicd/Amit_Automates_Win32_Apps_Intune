@@ -42,6 +42,42 @@ function Invoke-GraphJson {
     }
 }
 
+function Upload-AzureBlob {
+    param([string]$SasUri, [byte[]]$Bytes)
+
+    $chunkSize = 4 * 1024 * 1024  # 4 MB chunks
+    $blockIds  = @()
+    $offset    = 0
+    $chunkNum  = 0
+
+    while ($offset -lt $Bytes.Length) {
+        $length   = [Math]::Min($chunkSize, $Bytes.Length - $offset)
+        $chunk    = $Bytes[$offset..($offset + $length - 1)]
+        $blockId  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($chunkNum.ToString().PadLeft(10, '0')))
+        $blockIds += $blockId
+        $blockUri = "$SasUri&comp=block&blockid=$([Uri]::EscapeDataString($blockId))"
+
+        Invoke-RestMethod -Method PUT -Uri $blockUri -Body $chunk -Headers @{
+            "Content-Type" = "application/octet-stream"
+        } | Out-Null
+
+        Write-Host "  Chunk $chunkNum uploaded ($length bytes)"
+        $offset   += $length
+        $chunkNum++
+    }
+
+    # Commit block list
+    $blockListXml = "<?xml version='1.0' encoding='utf-8'?><BlockList>"
+    foreach ($id in $blockIds) { $blockListXml += "<Latest>$id</Latest>" }
+    $blockListXml += "</BlockList>"
+
+    Invoke-RestMethod -Method PUT -Uri "$SasUri&comp=blocklist" -Body $blockListXml -Headers @{
+        "Content-Type" = "application/xml"
+    } | Out-Null
+
+    Write-Host "Block list committed ($chunkNum chunks)"
+}
+
 Write-Host "--- 1. Authenticate (OIDC) ---"
 
 $tokenObj   = Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop
@@ -68,14 +104,28 @@ $enc           = $xml.ApplicationInfo.EncryptionInfo
 $fileSize      = [long]$xml.ApplicationInfo.UnencryptedContentSize
 $setupFilePath = $configRaw.setupFile
 
-Write-Host "Setup file   : $setupFilePath"
-Write-Host "Content size : $fileSize"
-Write-Host "EncKey length: $($enc.EncryptionKey.Trim().Length)"
+Write-Host "Setup file : $setupFilePath"
+Write-Host "Plain size : $fileSize"
+Write-Host "EncKey len : $($enc.EncryptionKey.Trim().Length)"
 
-Write-Host "--- 3. Check existing app ---"
+Write-Host "--- 3. Read encrypted bytes ---"
 
-$dn       = $appName.Replace("'","''")
-$existing = Invoke-GraphJson -Method GET -Uri "$base/deviceAppManagement/mobileApps?`$filter=displayName eq '$dn'" -Headers $headers
+$zip2      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
+$encEntry  = $zip2.Entries | Where-Object { $_.Name -eq "IntunePackage.intunewin" } | Select-Object -First 1
+$encStream = $encEntry.Open()
+$ms        = New-Object System.IO.MemoryStream
+$encStream.CopyTo($ms)
+$encBytes  = $ms.ToArray()
+$ms.Dispose()
+$encStream.Close()
+$zip2.Dispose()
+$encryptedSize = $encBytes.Length
+Write-Host "Encrypted bytes: $encryptedSize"
+
+Write-Host "--- 4. Check existing app ---"
+
+$dn          = $appName.Replace("'","''")
+$existing    = Invoke-GraphJson -Method GET -Uri "$base/deviceAppManagement/mobileApps?`$filter=displayName eq '$dn'" -Headers $headers
 $existingApp = $existing.value | Where-Object { $_.displayName -eq $appName } | Select-Object -First 1
 
 if ($existingApp) {
@@ -89,9 +139,9 @@ if ($existingApp) {
     $appId = $null
 }
 
-Write-Host "--- 4. Create / update app shell ---"
+Write-Host "--- 5. Create / update app shell ---"
 
-$detectCfg = $configRaw.detectionRule
+$detectCfg      = $configRaw.detectionRule
 $detectionRules = @()
 if ($detectCfg.type -eq "msi") {
     $detectionRules = @(@{
@@ -126,24 +176,13 @@ if ($appId) {
     Write-Host "App created: $appId"
 }
 
-Write-Host "--- 5. Upload content ---"
+Write-Host "--- 6. Upload content ---"
 
-$cv   = Invoke-GraphJson -Method POST -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions" -Headers $headers -Body "{}"
+$cv   = Invoke-GraphJson -Method POST `
+    -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions" `
+    -Headers $headers -Body "{}"
 $cvId = $cv.id
 Write-Host "Content version: $cvId"
-
-# Read encrypted bytes reliably using MemoryStream
-$zip2      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
-$encEntry2 = $zip2.Entries | Where-Object { $_.Name -eq "IntunePackage.intunewin" } | Select-Object -First 1
-$encStream = $encEntry2.Open()
-$ms        = New-Object System.IO.MemoryStream
-$encStream.CopyTo($ms)
-$encBytes  = $ms.ToArray()
-$ms.Dispose()
-$encStream.Close()
-$zip2.Dispose()
-$encryptedSize = $encBytes.Length
-Write-Host "Encrypted bytes read: $encryptedSize"
 
 $fileEntry = Invoke-GraphJson -Method POST `
     -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files" `
@@ -167,16 +206,12 @@ do {
     Write-Host "State: $($fileEntry.uploadState)"
 } while (-not $fileEntry.azureStorageUri -and $waited -lt 60)
 
-if (-not $fileEntry.azureStorageUri) { Write-Error "No SAS URI"; exit 1 }
+if (-not $fileEntry.azureStorageUri) { Write-Error "No SAS URI received"; exit 1 }
 
-Write-Host "Uploading $([math]::Round($encryptedSize/1MB,2)) MB to Azure Blob..."
-Invoke-RestMethod -Method PUT -Uri $fileEntry.azureStorageUri -Body $encBytes -Headers @{
-    "x-ms-blob-type" = "BlockBlob"
-    "Content-Type"   = "application/octet-stream"
-}
-Write-Host "Upload done"
+Write-Host "Uploading via block blob chunks..."
+Upload-AzureBlob -SasUri $fileEntry.azureStorageUri -Bytes $encBytes
 
-Write-Host "Committing file..."
+Write-Host "Committing file encryption info..."
 $commitBody = @{
     fileEncryptionInfo = @{
         encryptionKey        = $enc.EncryptionKey.Trim()
@@ -193,6 +228,7 @@ Invoke-GraphJson -Method POST `
     -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId/commit" `
     -Headers $headers -Body $commitBody
 
+Write-Host "Waiting for commit..."
 $waited = 0
 do {
     Start-Sleep -Seconds 5; $waited += 5
@@ -203,17 +239,18 @@ do {
 } while ($fileEntry.uploadState -notmatch "commitFile" -and $waited -lt 120)
 
 if ($fileEntry.uploadState -eq "commitFileFailed") {
-    Write-Error "File commit failed. Check encryption info."
+    Write-Error "File commit failed. Encryption info mismatch or upload corruption."
     exit 1
 }
 
+Write-Host "Committing content version to app..."
 Invoke-GraphJson -Method PATCH -Uri "$base/deviceAppManagement/mobileApps/$appId" -Headers $headers -Body @{
     "@odata.type"           = "#microsoft.graph.win32LobApp"
     committedContentVersion = $cvId
 }
 Write-Host "Content version committed"
 
-Write-Host "--- 6. Assign to All Devices ---"
+Write-Host "--- 7. Assign to All Devices ---"
 
 Invoke-GraphJson -Method POST `
     -Uri "$base/deviceAppManagement/mobileApps/$appId/assign" `
