@@ -108,7 +108,7 @@ try {
         Write-Warning "Version '$version' looks unusual — continuing anyway."
     }
 
-    Write-Host $version   # sole stdout line; captured by the workflow step
+    Write-Output $version
     exit 0
 }
 catch {
