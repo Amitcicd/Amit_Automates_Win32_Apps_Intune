@@ -24,8 +24,6 @@ Write-Host "Package : $pkgPath ($([math]::Round((Get-Item $pkgPath).Length/1MB,2
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# ── Helper: same pattern as working intune-auto-syn script ──────────────────
-
 function Invoke-GraphJson {
     param(
         [ValidateSet('GET','POST','PATCH','DELETE')] [string] $Method,
@@ -44,21 +42,15 @@ function Invoke-GraphJson {
     }
 }
 
-# ── 1. Auth via OIDC (replaces client_credentials in working script) ─────────
-
 Write-Host "--- 1. Authenticate (OIDC) ---"
 
 $tokenObj   = Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop
 $plainToken = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
     [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenObj.Token)
 )
-
-# Same header pattern as working script
 $headers = @{ Authorization = "Bearer $plainToken" }
 $base    = "https://graph.microsoft.com/beta"
-Write-Host "Auth token acquired via OIDC (expires: $($tokenObj.ExpiresOn))"
-
-# ── 2. Read .intunewin metadata ───────────────────────────────────────────────
+Write-Host "Auth token acquired (expires: $($tokenObj.ExpiresOn))"
 
 Write-Host "--- 2. Read .intunewin metadata ---"
 
@@ -70,18 +62,15 @@ $xmlEntry = $zip.Entries | Where-Object { $_.Name -eq "Detection.xml" } | Select
 $reader   = New-Object System.IO.StreamReader($xmlEntry.Open())
 $xml      = [xml]$reader.ReadToEnd()
 $reader.Close()
-$encEntry      = $zip.Entries | Where-Object { $_.Name -eq "IntunePackage.intunewin" } | Select-Object -First 1
-$encryptedSize = $encEntry.Length
 $zip.Dispose()
 
 $enc           = $xml.ApplicationInfo.EncryptionInfo
 $fileSize      = [long]$xml.ApplicationInfo.UnencryptedContentSize
-$setupFilePath = $configRaw.setupFile   # e.g. npp.8.9.5.Installer.x64.msi
+$setupFilePath = $configRaw.setupFile
 
 Write-Host "Setup file   : $setupFilePath"
-Write-Host "Content size : $fileSize  Encrypted: $encryptedSize"
-
-# ── 3. Check existing app ─────────────────────────────────────────────────────
+Write-Host "Content size : $fileSize"
+Write-Host "EncKey length: $($enc.EncryptionKey.Trim().Length)"
 
 Write-Host "--- 3. Check existing app ---"
 
@@ -99,8 +88,6 @@ if ($existingApp) {
     Write-Host "Not found - creating new."
     $appId = $null
 }
-
-# ── 4. Create or update app shell ─────────────────────────────────────────────
 
 Write-Host "--- 4. Create / update app shell ---"
 
@@ -132,23 +119,32 @@ $appBody = @{
 
 if ($appId) {
     Invoke-GraphJson -Method PATCH -Uri "$base/deviceAppManagement/mobileApps/$appId" -Headers $headers -Body $appBody
-    Write-Host "App updated"
+    Write-Host "App updated: $appId"
 } else {
     $newApp = Invoke-GraphJson -Method POST -Uri "$base/deviceAppManagement/mobileApps" -Headers $headers -Body $appBody
     $appId  = $newApp.id
     Write-Host "App created: $appId"
 }
 
-# ── 5. Upload content ─────────────────────────────────────────────────────────
-
 Write-Host "--- 5. Upload content ---"
 
-# Create content version
 $cv   = Invoke-GraphJson -Method POST -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions" -Headers $headers -Body "{}"
 $cvId = $cv.id
 Write-Host "Content version: $cvId"
 
-# Create file entry
+# Read encrypted bytes reliably using MemoryStream
+$zip2      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
+$encEntry2 = $zip2.Entries | Where-Object { $_.Name -eq "IntunePackage.intunewin" } | Select-Object -First 1
+$encStream = $encEntry2.Open()
+$ms        = New-Object System.IO.MemoryStream
+$encStream.CopyTo($ms)
+$encBytes  = $ms.ToArray()
+$ms.Dispose()
+$encStream.Close()
+$zip2.Dispose()
+$encryptedSize = $encBytes.Length
+Write-Host "Encrypted bytes read: $encryptedSize"
+
 $fileEntry = Invoke-GraphJson -Method POST `
     -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files" `
     -Headers $headers `
@@ -161,7 +157,6 @@ $fileEntry = Invoke-GraphJson -Method POST `
 $fileId = $fileEntry.id
 Write-Host "File entry: $fileId"
 
-# Wait for SAS URI
 Write-Host "Waiting for SAS URI..."
 $waited = 0
 do {
@@ -172,41 +167,32 @@ do {
     Write-Host "State: $($fileEntry.uploadState)"
 } while (-not $fileEntry.azureStorageUri -and $waited -lt 60)
 
-if (-not $fileEntry.azureStorageUri) { Write-Error "No SAS URI received"; exit 1 }
-
-# Extract encrypted content and upload to Azure Blob
-$zip2      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
-$encEntry2 = $zip2.Entries | Where-Object { $_.Name -eq "IntunePackage.intunewin" } | Select-Object -First 1
-$encStream = $encEntry2.Open()
-$encBytes  = New-Object byte[] $encryptedSize
-$encStream.Read($encBytes, 0, $encryptedSize) | Out-Null
-$encStream.Close()
-$zip2.Dispose()
+if (-not $fileEntry.azureStorageUri) { Write-Error "No SAS URI"; exit 1 }
 
 Write-Host "Uploading $([math]::Round($encryptedSize/1MB,2)) MB to Azure Blob..."
 Invoke-RestMethod -Method PUT -Uri $fileEntry.azureStorageUri -Body $encBytes -Headers @{
     "x-ms-blob-type" = "BlockBlob"
+    "Content-Type"   = "application/octet-stream"
 }
-Write-Host "Upload complete"
+Write-Host "Upload done"
 
-# Commit file
+Write-Host "Committing file..."
+$commitBody = @{
+    fileEncryptionInfo = @{
+        encryptionKey        = $enc.EncryptionKey.Trim()
+        macKey               = $enc.MacKey.Trim()
+        initializationVector = $enc.InitializationVector.Trim()
+        mac                  = $enc.Mac.Trim()
+        profileIdentifier    = $enc.ProfileIdentifier.Trim()
+        fileDigest           = $enc.FileDigest.Trim()
+        fileDigestAlgorithm  = $enc.FileDigestAlgorithm.Trim()
+    }
+} | ConvertTo-Json -Depth 5
+
 Invoke-GraphJson -Method POST `
     -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId/commit" `
-    -Headers $headers `
-    -Body @{
-        fileEncryptionInfo = @{
-            encryptionKey        = $enc.EncryptionKey
-            macKey               = $enc.MacKey
-            initializationVector = $enc.InitializationVector
-            mac                  = $enc.Mac
-            profileIdentifier    = $enc.ProfileIdentifier
-            fileDigest           = $enc.FileDigest
-            fileDigestAlgorithm  = $enc.FileDigestAlgorithm
-        }
-    }
+    -Headers $headers -Body $commitBody
 
-# Wait for commit
-Write-Host "Waiting for commit..."
 $waited = 0
 do {
     Start-Sleep -Seconds 5; $waited += 5
@@ -216,14 +202,16 @@ do {
     Write-Host "Upload state: $($fileEntry.uploadState)"
 } while ($fileEntry.uploadState -notmatch "commitFile" -and $waited -lt 120)
 
-# Commit content version to app
+if ($fileEntry.uploadState -eq "commitFileFailed") {
+    Write-Error "File commit failed. Check encryption info."
+    exit 1
+}
+
 Invoke-GraphJson -Method PATCH -Uri "$base/deviceAppManagement/mobileApps/$appId" -Headers $headers -Body @{
     "@odata.type"           = "#microsoft.graph.win32LobApp"
     committedContentVersion = $cvId
 }
 Write-Host "Content version committed"
-
-# ── 6. Assign to All Devices ──────────────────────────────────────────────────
 
 Write-Host "--- 6. Assign to All Devices ---"
 
