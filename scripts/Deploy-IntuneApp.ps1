@@ -24,69 +24,93 @@ Write-Host "Package : $pkgPath ($([math]::Round((Get-Item $pkgPath).Length/1MB,2
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
-    Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
+# ── Helper: same pattern as working intune-auto-syn script ──────────────────
+
+function Invoke-GraphJson {
+    param(
+        [ValidateSet('GET','POST','PATCH','DELETE')] [string] $Method,
+        [string] $Uri,
+        [hashtable] $Headers,
+        $Body
+    )
+    if ($PSBoundParameters.ContainsKey('Body')) {
+        if ($Body -is [string]) {
+            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -Body $Body -ContentType "application/json"
+        } else {
+            return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -Body ($Body | ConvertTo-Json -Depth 10) -ContentType "application/json"
+        }
+    } else {
+        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers
+    }
 }
-Import-Module Microsoft.Graph.Authentication -Force
+
+# ── 1. Auth via OIDC (replaces client_credentials in working script) ─────────
 
 Write-Host "--- 1. Authenticate (OIDC) ---"
 
-$tokenObj = Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop
-Connect-MgGraph -AccessToken $tokenObj.Token -NoWelcome
-Write-Host "Connected to Microsoft Graph"
-
+$tokenObj   = Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop
 $plainToken = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
     [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenObj.Token)
 )
-$headers = @{ "Authorization" = "Bearer $plainToken"; "Content-Type" = "application/json" }
-$graphBase = "https://graph.microsoft.com/beta"
+
+# Same header pattern as working script
+$headers = @{ Authorization = "Bearer $plainToken" }
+$base    = "https://graph.microsoft.com/beta"
+Write-Host "Auth token acquired via OIDC (expires: $($tokenObj.ExpiresOn))"
+
+# ── 2. Read .intunewin metadata ───────────────────────────────────────────────
 
 Write-Host "--- 2. Read .intunewin metadata ---"
 
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$zip = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
-$xmlEntry = $zip.Entries | Where-Object { $_.Name -eq "Detection.xml" } | Select-Object -First 1
-$reader = New-Object System.IO.StreamReader($xmlEntry.Open())
-$xml = [xml]$reader.ReadToEnd()
-$reader.Close()
+$configRaw = Get-Content "app-config.json" | ConvertFrom-Json
 
-$encEntry = $zip.Entries | Where-Object { $_.Name -eq "IntunePackage.intunewin" } | Select-Object -First 1
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$zip      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
+$xmlEntry = $zip.Entries | Where-Object { $_.Name -eq "Detection.xml" } | Select-Object -First 1
+$reader   = New-Object System.IO.StreamReader($xmlEntry.Open())
+$xml      = [xml]$reader.ReadToEnd()
+$reader.Close()
+$encEntry      = $zip.Entries | Where-Object { $_.Name -eq "IntunePackage.intunewin" } | Select-Object -First 1
 $encryptedSize = $encEntry.Length
 $zip.Dispose()
 
-$enc      = $xml.ApplicationInfo.EncryptionInfo
-$fileSize = [long]$xml.ApplicationInfo.UnencryptedContentSize
-$fileName = $xml.ApplicationInfo.FileName
-Write-Host "File: $fileName  Size: $fileSize  Encrypted: $encryptedSize"
+$enc           = $xml.ApplicationInfo.EncryptionInfo
+$fileSize      = [long]$xml.ApplicationInfo.UnencryptedContentSize
+$setupFilePath = $configRaw.setupFile   # e.g. npp.8.9.5.Installer.x64.msi
+
+Write-Host "Setup file   : $setupFilePath"
+Write-Host "Content size : $fileSize  Encrypted: $encryptedSize"
+
+# ── 3. Check existing app ─────────────────────────────────────────────────────
 
 Write-Host "--- 3. Check existing app ---"
 
-$configRaw = Get-Content "app-config.json" | ConvertFrom-Json
-$filter = [System.Web.HttpUtility]::UrlEncode("displayName eq '$appName'")
-$existing = Invoke-MgGraphRequest -Method GET -Uri "$graphBase/deviceAppManagement/mobileApps?`$filter=displayName eq '$appName'" -Headers $headers
+$dn       = $appName.Replace("'","''")
+$existing = Invoke-GraphJson -Method GET -Uri "$base/deviceAppManagement/mobileApps?`$filter=displayName eq '$dn'" -Headers $headers
 $existingApp = $existing.value | Where-Object { $_.displayName -eq $appName } | Select-Object -First 1
 
 if ($existingApp) {
-    Write-Host "Existing app found: $($existingApp.id)  v$($existingApp.displayVersion)"
+    Write-Host "Found: $($existingApp.id)  v$($existingApp.displayVersion)"
     if ($existingApp.displayVersion -eq $appVersion -and -not $forceUpdate) {
-        Write-Host "Same version deployed. Skipping."
-        exit 0
+        Write-Host "Same version deployed. Skipping."; exit 0
     }
     $appId = $existingApp.id
 } else {
-    Write-Host "App not found - creating new."
+    Write-Host "Not found - creating new."
     $appId = $null
 }
 
-Write-Host "--- 4. Create or update app shell ---"
+# ── 4. Create or update app shell ─────────────────────────────────────────────
+
+Write-Host "--- 4. Create / update app shell ---"
 
 $detectCfg = $configRaw.detectionRule
 $detectionRules = @()
 if ($detectCfg.type -eq "msi") {
     $detectionRules = @(@{
-        "@odata.type"    = "#microsoft.graph.win32LobAppProductCodeDetection"
-        productCode      = $detectCfg.productCode
-        productVersion   = $appVersion
+        "@odata.type"          = "#microsoft.graph.win32LobAppProductCodeDetection"
+        productCode            = $detectCfg.productCode
+        productVersion         = $appVersion
         productVersionOperator = "greaterThanOrEqual"
     })
 }
@@ -97,64 +121,61 @@ $appBody = @{
     displayVersion       = $appVersion
     description          = $description
     publisher            = $publisher
-    fileName             = $fileName
+    fileName             = $setupFilePath
+    setupFilePath        = $setupFilePath
     installCommandLine   = $installCmd
     uninstallCommandLine = $uninstallCmd
     installExperience    = @{ runAsAccount = "system"; deviceRestartBehavior = "suppress" }
     detectionRules       = $detectionRules
     minimumSupportedWindowsRelease = "1903"
-} | ConvertTo-Json -Depth 10
+}
 
 if ($appId) {
-    Invoke-MgGraphRequest -Method PATCH -Uri "$graphBase/deviceAppManagement/mobileApps/$appId" -Body $appBody -Headers $headers -ContentType "application/json"
-    Write-Host "App metadata updated"
+    Invoke-GraphJson -Method PATCH -Uri "$base/deviceAppManagement/mobileApps/$appId" -Headers $headers -Body $appBody
+    Write-Host "App updated"
 } else {
-    $newApp = Invoke-MgGraphRequest -Method POST -Uri "$graphBase/deviceAppManagement/mobileApps" -Body $appBody -Headers $headers -ContentType "application/json"
-    $appId = $newApp.id
+    $newApp = Invoke-GraphJson -Method POST -Uri "$base/deviceAppManagement/mobileApps" -Headers $headers -Body $appBody
+    $appId  = $newApp.id
     Write-Host "App created: $appId"
 }
+
+# ── 5. Upload content ─────────────────────────────────────────────────────────
 
 Write-Host "--- 5. Upload content ---"
 
 # Create content version
-$cv = Invoke-MgGraphRequest -Method POST `
-    -Uri "$graphBase/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions" `
-    -Body "{}" -Headers $headers -ContentType "application/json"
+$cv   = Invoke-GraphJson -Method POST -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions" -Headers $headers -Body "{}"
 $cvId = $cv.id
 Write-Host "Content version: $cvId"
 
 # Create file entry
-$fileBody = @{
-    name           = $fileName
-    size           = $fileSize
-    sizeEncrypted  = $encryptedSize
-    manifest       = $null
-    isDependency   = $false
-} | ConvertTo-Json
-
-$fileEntry = Invoke-MgGraphRequest -Method POST `
-    -Uri "$graphBase/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files" `
-    -Body $fileBody -Headers $headers -ContentType "application/json"
+$fileEntry = Invoke-GraphJson -Method POST `
+    -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files" `
+    -Headers $headers `
+    -Body @{
+        name          = "IntunePackage.intunewin"
+        size          = $fileSize
+        sizeEncrypted = $encryptedSize
+        isDependency  = $false
+    }
 $fileId = $fileEntry.id
-Write-Host "File entry created: $fileId"
+Write-Host "File entry: $fileId"
 
 # Wait for SAS URI
-Write-Host "Waiting for Azure Storage URI..."
-$maxWait = 30
-$waited  = 0
+Write-Host "Waiting for SAS URI..."
+$waited = 0
 do {
-    Start-Sleep -Seconds 3
-    $waited += 3
-    $fileEntry = Invoke-MgGraphRequest -Method GET `
-        -Uri "$graphBase/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId" `
+    Start-Sleep -Seconds 3; $waited += 3
+    $fileEntry = Invoke-GraphJson -Method GET `
+        -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId" `
         -Headers $headers
-} while ((-not $fileEntry.azureStorageUri) -and $waited -lt $maxWait)
+    Write-Host "State: $($fileEntry.uploadState)"
+} while (-not $fileEntry.azureStorageUri -and $waited -lt 60)
 
-if (-not $fileEntry.azureStorageUri) { Write-Error "SAS URI not received"; exit 1 }
-Write-Host "SAS URI received"
+if (-not $fileEntry.azureStorageUri) { Write-Error "No SAS URI received"; exit 1 }
 
-# Extract encrypted content from .intunewin and upload to Azure Blob
-$zip2 = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
+# Extract encrypted content and upload to Azure Blob
+$zip2      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
 $encEntry2 = $zip2.Entries | Where-Object { $_.Name -eq "IntunePackage.intunewin" } | Select-Object -First 1
 $encStream = $encEntry2.Open()
 $encBytes  = New-Object byte[] $encryptedSize
@@ -162,79 +183,70 @@ $encStream.Read($encBytes, 0, $encryptedSize) | Out-Null
 $encStream.Close()
 $zip2.Dispose()
 
-$sasUri = $fileEntry.azureStorageUri
-$blobHeaders = @{
-    "x-ms-blob-type"  = "BlockBlob"
-    "Content-Length"  = $encryptedSize.ToString()
-}
 Write-Host "Uploading $([math]::Round($encryptedSize/1MB,2)) MB to Azure Blob..."
-Invoke-RestMethod -Method PUT -Uri $sasUri -Body $encBytes -Headers $blobHeaders
+Invoke-RestMethod -Method PUT -Uri $fileEntry.azureStorageUri -Body $encBytes -Headers @{
+    "x-ms-blob-type" = "BlockBlob"
+}
 Write-Host "Upload complete"
 
 # Commit file
-$commitBody = @{
-    fileEncryptionInfo = @{
-        encryptionKey        = $enc.EncryptionKey
-        macKey               = $enc.MacKey
-        initializationVector = $enc.InitializationVector
-        mac                  = $enc.Mac
-        profileIdentifier    = $enc.ProfileIdentifier
-        fileDigest           = $enc.FileDigest
-        fileDigestAlgorithm  = $enc.FileDigestAlgorithm
+Invoke-GraphJson -Method POST `
+    -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId/commit" `
+    -Headers $headers `
+    -Body @{
+        fileEncryptionInfo = @{
+            encryptionKey        = $enc.EncryptionKey
+            macKey               = $enc.MacKey
+            initializationVector = $enc.InitializationVector
+            mac                  = $enc.Mac
+            profileIdentifier    = $enc.ProfileIdentifier
+            fileDigest           = $enc.FileDigest
+            fileDigestAlgorithm  = $enc.FileDigestAlgorithm
+        }
     }
-} | ConvertTo-Json -Depth 5
-
-Invoke-MgGraphRequest -Method POST `
-    -Uri "$graphBase/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId/commit" `
-    -Body $commitBody -Headers $headers -ContentType "application/json"
 
 # Wait for commit
-Write-Host "Waiting for file commit..."
+Write-Host "Waiting for commit..."
 $waited = 0
 do {
-    Start-Sleep -Seconds 5
-    $waited += 5
-    $fileEntry = Invoke-MgGraphRequest -Method GET `
-        -Uri "$graphBase/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId" `
+    Start-Sleep -Seconds 5; $waited += 5
+    $fileEntry = Invoke-GraphJson -Method GET `
+        -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId" `
         -Headers $headers
     Write-Host "Upload state: $($fileEntry.uploadState)"
 } while ($fileEntry.uploadState -notmatch "commitFile" -and $waited -lt 120)
 
 # Commit content version to app
-$cvCommit = @{
-    "@odata.type"            = "#microsoft.graph.win32LobApp"
-    committedContentVersion  = $cvId
-} | ConvertTo-Json
-
-Invoke-MgGraphRequest -Method PATCH -Uri "$graphBase/deviceAppManagement/mobileApps/$appId" `
-    -Body $cvCommit -Headers $headers -ContentType "application/json"
+Invoke-GraphJson -Method PATCH -Uri "$base/deviceAppManagement/mobileApps/$appId" -Headers $headers -Body @{
+    "@odata.type"           = "#microsoft.graph.win32LobApp"
+    committedContentVersion = $cvId
+}
 Write-Host "Content version committed"
+
+# ── 6. Assign to All Devices ──────────────────────────────────────────────────
 
 Write-Host "--- 6. Assign to All Devices ---"
 
-$assignBody = @{
-    mobileAppAssignments = @(@{
-        "@odata.type" = "#microsoft.graph.mobileAppAssignment"
-        intent        = "required"
-        target        = @{ "@odata.type" = "#microsoft.graph.allDevicesAssignmentTarget" }
-        settings      = @{
-            "@odata.type"              = "#microsoft.graph.win32LobAppAssignmentSettings"
-            notifications              = "showAll"
-            restartSettings            = $null
-            installTimeSettings        = $null
-            deliveryOptimizationPriority = "notConfigured"
-        }
-    })
-} | ConvertTo-Json -Depth 10
-
-Invoke-MgGraphRequest -Method POST `
-    -Uri "$graphBase/deviceAppManagement/mobileApps/$appId/assign" `
-    -Body $assignBody -Headers $headers -ContentType "application/json"
+Invoke-GraphJson -Method POST `
+    -Uri "$base/deviceAppManagement/mobileApps/$appId/assign" `
+    -Headers $headers `
+    -Body @{
+        mobileAppAssignments = @(@{
+            "@odata.type" = "#microsoft.graph.mobileAppAssignment"
+            intent        = "required"
+            target        = @{ "@odata.type" = "#microsoft.graph.allDevicesAssignmentTarget" }
+            settings      = @{
+                "@odata.type"                = "#microsoft.graph.win32LobAppAssignmentSettings"
+                notifications                = "showAll"
+                deliveryOptimizationPriority = "notConfigured"
+            }
+        })
+    }
 Write-Host "Assigned to All Devices (Required)"
 
 Write-Host "DEPLOYMENT COMPLETE"
 Write-Host "App       : $appName"
 Write-Host "Version   : $appVersion"
 Write-Host "Intune ID : $appId"
-Write-Host "Auth      : OIDC - pure Graph API"
+Write-Host "Auth      : OIDC"
 Write-Host "Assignment: All Devices - Required"
