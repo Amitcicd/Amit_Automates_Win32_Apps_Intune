@@ -111,7 +111,6 @@ jobs:
     name: 🚢 Deploy to Intune (OIDC)
     runs-on: windows-latest
     needs: [prepare, build]
-    environment: production
 
     # ⬇️  OIDC requires these two permissions — same as your primaryuser workflow
     permissions:
