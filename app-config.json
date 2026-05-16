@@ -1,46 +1,20 @@
 {
-  "_comment": "Edit this file to match your application. Do NOT commit secrets here.",
-
-  "displayName":    "My Win32 App",
-  "publisher":      "Contoso IT",
-  "description":    "Managed deployment via GitHub Actions → Microsoft Intune",
-
-  "setupFile":      "setup.msi",
+  "displayName":    "Notepad++ 8.9.5",
+  "publisher":      "Notepad++ Team",
+  "description":    "Notepad++ 8.9.5 x64 - Deployed via GitHub Actions and Microsoft Intune",
+  "setupFile":      "npp.8.9.5.Installer.x64.msi",
   "installerType":  "msi",
-
-  "installCommand":   "msiexec /i setup.msi /qn /norestart ALLUSERS=1",
-  "uninstallCommand": "msiexec /x {YOUR-PRODUCT-CODE-GUID-HERE} /qn /norestart",
-
+  "installCommand":   "msiexec /i npp.8.9.5.Installer.x64.msi /qn /norestart ALLUSERS=1 NOUPDATER=1",
+  "uninstallCommand": "msiexec /x {7765A790-5A33-4E30-AF0A-27A33E892121} /qn /norestart",
   "installExperience": "system",
   "restartBehavior":   "suppress",
-
   "detectionRule": {
-    "type": "msi",
-    "productCode": "{YOUR-PRODUCT-CODE-GUID-HERE}",
-
-    "_registry_example_comment": "Use type=registry if not an MSI",
-    "_registry": {
-      "type":      "registry",
-      "keyPath":   "HKEY_LOCAL_MACHINE\\SOFTWARE\\Contoso\\MyApp",
-      "valueName": "Version"
-    },
-
-    "_file_example_comment": "Use type=file for simple file-exists detection",
-    "_file": {
-      "type":         "file",
-      "path":         "C:\\Program Files\\Contoso\\MyApp",
-      "fileOrFolder": "MyApp.exe"
-    }
+    "type":        "msi",
+    "productCode": "{7765A790-5A33-4E30-AF0A-27A33E892121}"
   },
-
   "requirements": {
     "minimumOS":            "W10-21H2",
     "architecture":         "x64",
     "minimumDiskSpaceInMB": 500
-  },
-
-  "_minimumOS_values": [
-    "W10-1809", "W10-21H2", "W11-21H2", "W11-22H2", "W11-23H2",
-    "or a raw build number like 10.0.22631"
-  ]
+  }
 }
