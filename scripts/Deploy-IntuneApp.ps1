@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 
 Write-Host "--- 0. Bootstrap ---"
 
-$requiredEnv = @("APP_NAME","APP_VERSION","INSTALL_CMD","UNINSTALL_CMD","INTUNEWIN_PATH")
+$requiredEnv = @("APP_NAME","APP_VERSION","INSTALL_CMD","UNUNINSTALL_CMD","INTUNEWIN_PATH")
 foreach ($v in $requiredEnv) {
     if ([string]::IsNullOrWhiteSpace([System.Environment]::GetEnvironmentVariable($v))) {
         Write-Error "Missing required environment variable: $v"; exit 1
@@ -96,7 +96,10 @@ $configRaw = Get-Content "app-config.json" | ConvertFrom-Json
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
-$xmlEntry = $zip.Entries | Where-Object { $_.Name -eq "Detection.xml" } | Select-Object -First 1
+$xmlEntry = $zip.Entries | Where-Object { $_.Name -ieq "Detection.xml" } | Select-Object -First 1
+if (-not $xmlEntry) {
+    Write-Error "Detection.xml not found in $pkgPath"; exit 1
+}
 $reader   = New-Object System.IO.StreamReader($xmlEntry.Open())
 $xml      = [xml]$reader.ReadToEnd()
 $reader.Close()
@@ -120,8 +123,10 @@ Write-Host "FileDigest len   : $($enc.FileDigest.Trim().Length)"
 Write-Host "--- 3. Read encrypted bytes ---"
 
 $zip2      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
-$encEntry  = $zip2.Entries | Where-Object { $_.Name -eq "IntunePackage.intunewin" } | Select-Object -First 1
-Write-Host "Entry compression: $($encEntry.CompressionMethod)"
+$encEntry  = $zip2.Entries | Where-Object { $_.Name -ieq "IntunePackage.intunewin" } | Select-Object -First 1
+if (-not $encEntry) {
+    Write-Error "IntunePackage.intunewin not found in $pkgPath"; exit 1
+}
 $encStream = $encEntry.Open()
 $ms        = New-Object System.IO.MemoryStream
 $encStream.CopyTo($ms)
@@ -228,7 +233,9 @@ do {
     Write-Host "State: $($fileEntry.uploadState)"
 } while (-not $fileEntry.azureStorageUri -and $waited -lt 60)
 
-if (-not $fileEntry.azureStorageUri) { Write-Error "No SAS URI received"; exit 1 }
+if (-not $fileEntry.azureStorageUri) {
+    Write-Error "No SAS URI received"; exit 1
+}
 
 Write-Host "Uploading via block blob chunks..."
 Upload-AzureBlob -SasUri $fileEntry.azureStorageUri -Bytes $encBytes
