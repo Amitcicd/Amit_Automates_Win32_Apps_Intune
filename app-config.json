@@ -1,5 +1,6 @@
 {
   "displayName":    "Notepad++ 8.9.5",
+  "appVersion":     "8.9.5",
   "publisher":      "Notepad++ Team",
   "description":    "Notepad++ 8.9.5 x64 - Deployed via GitHub Actions and Microsoft Intune",
   "setupFile":      "npp.8.9.5.Installer.x64.msi",

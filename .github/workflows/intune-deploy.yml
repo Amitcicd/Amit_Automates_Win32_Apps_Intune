@@ -1,4 +1,4 @@
-name: 🚀 Intune Win32 App — Build, Package & Deploy (OIDC)
+name: Intune Win32 App - Build, Package and Deploy (OIDC)
 
 on:
   push:
@@ -21,17 +21,16 @@ env:
 
 jobs:
   prepare:
-    name: 📋 Read Config & Detect Version
+    name: Read Config and Detect Version
     runs-on: windows-latest
     outputs:
-      app_name:       ${{ steps.cfg.outputs.app_name }}
-      app_version:    ${{ steps.ver.outputs.app_version }}
-      setup_file:     ${{ steps.cfg.outputs.setup_file }}
-      installer_type: ${{ steps.cfg.outputs.installer_type }}
-      install_cmd:    ${{ steps.cfg.outputs.install_cmd }}
-      uninstall_cmd:  ${{ steps.cfg.outputs.uninstall_cmd }}
-      publisher:      ${{ steps.cfg.outputs.publisher }}
-      description:    ${{ steps.cfg.outputs.description }}
+      app_name:      ${{ steps.cfg.outputs.app_name }}
+      app_version:   ${{ steps.cfg.outputs.app_version }}
+      setup_file:    ${{ steps.cfg.outputs.setup_file }}
+      install_cmd:   ${{ steps.cfg.outputs.install_cmd }}
+      uninstall_cmd: ${{ steps.cfg.outputs.uninstall_cmd }}
+      publisher:     ${{ steps.cfg.outputs.publisher }}
+      description:   ${{ steps.cfg.outputs.description }}
 
     steps:
       - name: Checkout
@@ -42,26 +41,17 @@ jobs:
         shell: pwsh
         run: |
           $c = Get-Content "app-config.json" | ConvertFrom-Json
-          "app_name=$($c.displayName)"           >> $env:GITHUB_OUTPUT
-          "setup_file=$($c.setupFile)"            >> $env:GITHUB_OUTPUT
-          "installer_type=$($c.installerType)"    >> $env:GITHUB_OUTPUT
-          "install_cmd=$($c.installCommand)"      >> $env:GITHUB_OUTPUT
-          "uninstall_cmd=$($c.uninstallCommand)"  >> $env:GITHUB_OUTPUT
-          "publisher=$($c.publisher)"             >> $env:GITHUB_OUTPUT
-          "description=$($c.description)"         >> $env:GITHUB_OUTPUT
-
-      - name: Extract installer version
-        id: ver
-        shell: pwsh
-        run: |
-          $version = (.\scripts\Get-InstallerVersion.ps1 `
-            -InstallerPath "app\${{ steps.cfg.outputs.setup_file }}" `
-            -InstallerType "${{ steps.cfg.outputs.installer_type }}").Trim()
-          Write-Host "Detected version: $version"
-          "app_version=$version" >> $env:GITHUB_OUTPUT
+          "app_name=$($c.displayName)"          >> $env:GITHUB_OUTPUT
+          "app_version=$($c.appVersion)"         >> $env:GITHUB_OUTPUT
+          "setup_file=$($c.setupFile)"           >> $env:GITHUB_OUTPUT
+          "install_cmd=$($c.installCommand)"     >> $env:GITHUB_OUTPUT
+          "uninstall_cmd=$($c.uninstallCommand)" >> $env:GITHUB_OUTPUT
+          "publisher=$($c.publisher)"            >> $env:GITHUB_OUTPUT
+          "description=$($c.description)"        >> $env:GITHUB_OUTPUT
+          Write-Host "App: $($c.displayName) v$($c.appVersion)"
 
   build:
-    name: 📦 Build .intunewin
+    name: Build intunewin
     runs-on: windows-latest
     needs: prepare
 
@@ -83,7 +73,7 @@ jobs:
           if (-not $pkg) { throw "Package not created!" }
           Write-Host "Package: $($pkg.Name) ($([math]::Round($pkg.Length/1MB,2)) MB)"
 
-      - name: Upload .intunewin artifact
+      - name: Upload intunewin artifact
         uses: actions/upload-artifact@v4
         with:
           name: intunewin-${{ needs.prepare.outputs.app_name }}-v${{ needs.prepare.outputs.app_version }}-run${{ github.run_number }}
@@ -92,7 +82,7 @@ jobs:
           if-no-files-found: error
 
   deploy:
-    name: 🚢 Deploy to Intune (OIDC)
+    name: Deploy to Intune OIDC
     runs-on: windows-latest
     needs: [prepare, build]
 
@@ -104,13 +94,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download .intunewin artifact
+      - name: Download intunewin artifact
         uses: actions/download-artifact@v4
         with:
           name: intunewin-${{ needs.prepare.outputs.app_name }}-v${{ needs.prepare.outputs.app_version }}-run${{ github.run_number }}
           path: output
 
-      - name: Login to Azure (OIDC)
+      - name: Login to Azure OIDC
         uses: azure/login@v2
         with:
           client-id:  ${{ secrets.AZURE_CLIENT_ID }}
@@ -123,22 +113,21 @@ jobs:
         with:
           azPSVersion: latest
           inlineScript: |
-            $config        = Get-Content "app-config.json" | ConvertFrom-Json
-            $pkg           = Get-ChildItem -Path output -Filter "*.intunewin" | Select-Object -First 1
-            $version       = (.\scripts\Get-InstallerVersion.ps1 -InstallerPath "app\$($config.setupFile)" -InstallerType $config.installerType).Trim()
-            $env:INTUNEWIN_PATH  = $pkg.FullName
-            $env:APP_NAME        = $config.displayName
-            $env:APP_VERSION     = $version
-            $env:APP_PUBLISHER   = $config.publisher
-            $env:APP_DESC        = $config.description
-            $env:INSTALL_CMD     = $config.installCommand
-            $env:UNINSTALL_CMD   = $config.uninstallCommand
-            $env:FORCE_UPDATE    = "${{ github.event.inputs.force_update || 'false' }}"
+            $config             = Get-Content "app-config.json" | ConvertFrom-Json
+            $pkg                = Get-ChildItem -Path output -Filter "*.intunewin" | Select-Object -First 1
+            $env:INTUNEWIN_PATH = $pkg.FullName
+            $env:APP_NAME       = $config.displayName
+            $env:APP_VERSION    = $config.appVersion
+            $env:APP_PUBLISHER  = $config.publisher
+            $env:APP_DESC       = $config.description
+            $env:INSTALL_CMD    = $config.installCommand
+            $env:UNINSTALL_CMD  = $config.uninstallCommand
+            $env:FORCE_UPDATE   = "${{ github.event.inputs.force_update || 'false' }}"
             Write-Host "Deploying: $env:APP_NAME v$env:APP_VERSION"
             .\scripts\Deploy-IntuneApp.ps1
 
   release:
-    name: 🏷️ Create GitHub Release
+    name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [prepare, deploy]
     permissions:
@@ -148,7 +137,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download .intunewin artifact
+      - name: Download intunewin artifact
         uses: actions/download-artifact@v4
         with:
           name: intunewin-${{ needs.prepare.outputs.app_name }}-v${{ needs.prepare.outputs.app_version }}-run${{ github.run_number }}
@@ -158,17 +147,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ needs.prepare.outputs.app_version }}-${{ github.run_number }}"
-          name: "${{ needs.prepare.outputs.app_name }} — v${{ needs.prepare.outputs.app_version }} (#${{ github.run_number }})"
+          name: "${{ needs.prepare.outputs.app_name }} v${{ needs.prepare.outputs.app_version }} run ${{ github.run_number }}"
           body: |
             ## Deployment Summary
             | Field | Value |
             |---|---|
-            | **App** | ${{ needs.prepare.outputs.app_name }} |
-            | **Version** | ${{ needs.prepare.outputs.app_version }} |
-            | **Assigned** | All Devices (Required) |
-            | **Auth** | OIDC |
-            | **Run** | #${{ github.run_number }} |
-            | **Commit** | `${{ github.sha }}` |
+            | App | ${{ needs.prepare.outputs.app_name }} |
+            | Version | ${{ needs.prepare.outputs.app_version }} |
+            | Assigned | All Devices Required |
+            | Auth | OIDC no secrets |
+            | Run | ${{ github.run_number }} |
+            | Commit | ${{ github.sha }} |
           files: output/*.intunewin
           fail_on_unmatched_files: true
         env:
