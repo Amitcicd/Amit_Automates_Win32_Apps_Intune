@@ -81,6 +81,8 @@ function Upload-AzureBlob {
     Write-Host "Block list committed ($chunkNum chunks)"
 }
 
+# ── 1. Authenticate ───────────────────────────────────────────────────────────
+
 Write-Host "--- 1. Authenticate (OIDC) ---"
 
 $tokenObj   = Get-AzAccessToken -ResourceTypeName MSGraph -AsSecureString -ErrorAction Stop
@@ -91,16 +93,48 @@ $headers = @{ Authorization = "Bearer $plainToken" }
 $base    = "https://graph.microsoft.com/beta"
 Write-Host "Auth token acquired (expires: $($tokenObj.ExpiresOn))"
 
-Write-Host "--- 2. Read .intunewin metadata ---"
+# ── 2. Check existing app FIRST — skip everything if same version ─────────────
+
+Write-Host "--- 2. Check existing app ---"
+
+$dn          = $appName.Replace("'","''")
+$existing    = Invoke-GraphJson -Method GET -Uri "$base/deviceAppManagement/mobileApps?`$filter=displayName eq '$dn'" -Headers $headers
+$existingApp = $existing.value | Where-Object { $_.displayName -eq $appName } | Select-Object -First 1
+
+if ($existingApp) {
+    Write-Host "Found in Intune  : $($existingApp.id)"
+    Write-Host "Deployed version : $($existingApp.displayVersion)"
+    Write-Host "Pipeline version : $appVersion"
+
+    if ($existingApp.displayVersion -eq $appVersion -and -not $forceUpdate) {
+        Write-Host ""
+        Write-Host "=========================================="
+        Write-Host "  ALREADY IN INTUNE - NO ACTION NEEDED"
+        Write-Host "  App     : $appName"
+        Write-Host "  Version : $appVersion"
+        Write-Host "  ID      : $($existingApp.id)"
+        Write-Host "  Status  : Up to date. Skipping upload."
+        Write-Host "=========================================="
+        exit 0
+    }
+
+    Write-Host "Version changed ($($existingApp.displayVersion) -> $appVersion) - updating."
+    $appId = $existingApp.id
+} else {
+    Write-Host "Not found in Intune - will create new."
+    $appId = $null
+}
+
+# ── 3. Read .intunewin metadata (only if upload needed) ───────────────────────
+
+Write-Host "--- 3. Read .intunewin metadata ---"
 
 $configRaw = Get-Content "app-config.json" | ConvertFrom-Json
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
 $xmlEntry = $zip.Entries | Where-Object { $_.Name -ieq "Detection.xml" } | Select-Object -First 1
-if (-not $xmlEntry) {
-    Write-Error "Detection.xml not found in $pkgPath"; exit 1
-}
+if (-not $xmlEntry) { Write-Error "Detection.xml not found in $pkgPath"; exit 1 }
 
 $reader   = New-Object System.IO.StreamReader($xmlEntry.Open())
 $xml      = [xml]$reader.ReadToEnd()
@@ -111,22 +145,16 @@ $enc           = $xml.ApplicationInfo.EncryptionInfo
 $fileSize      = [long]$xml.ApplicationInfo.UnencryptedContentSize
 $setupFilePath = $configRaw.setupFile
 
-Write-Host "Setup file       : $setupFilePath"
-Write-Host "Plain size       : $fileSize"
-Write-Host "ProfileIdentifier: $($enc.ProfileIdentifier)"
-Write-Host "EncryptionKey len: $($enc.EncryptionKey.Trim().Length)"
-Write-Host "MacKey len       : $($enc.MacKey.Trim().Length)"
-Write-Host "IV len           : $($enc.InitializationVector.Trim().Length)"
-Write-Host "Mac len          : $($enc.Mac.Trim().Length)"
-Write-Host "FileDigest len   : $($enc.FileDigest.Trim().Length)"
+Write-Host "Setup file : $setupFilePath"
+Write-Host "Plain size : $fileSize"
 
-Write-Host "--- 3. Read encrypted bytes ---"
+# ── 4. Read encrypted bytes ───────────────────────────────────────────────────
+
+Write-Host "--- 4. Read encrypted bytes ---"
 
 $zip2      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
 $encEntry  = $zip2.Entries | Where-Object { $_.Name -ieq "IntunePackage.intunewin" } | Select-Object -First 1
-if (-not $encEntry) {
-    Write-Error "IntunePackage.intunewin not found in $pkgPath"; exit 1
-}
+if (-not $encEntry) { Write-Error "IntunePackage.intunewin not found in $pkgPath"; exit 1 }
 
 $encStream = $encEntry.Open()
 $ms        = New-Object System.IO.MemoryStream
@@ -135,32 +163,10 @@ $encBytes  = $ms.ToArray()
 $ms.Dispose()
 $encStream.Close()
 $zip2.Dispose()
-
 $encryptedSize = $encBytes.Length
 Write-Host "Encrypted bytes: $encryptedSize"
 
-$macFromXml = [Convert]::FromBase64String($enc.Mac.Trim())
-$first32    = $encBytes[0..31]
-$macMatch   = -not (Compare-Object $macFromXml $first32)
-Write-Host "MAC matches file header: $macMatch"
-
-Write-Host "--- 4. Check existing app ---"
-
-$dn          = $appName.Replace("'","''")
-$existing    = Invoke-GraphJson -Method GET -Uri "$base/deviceAppManagement/mobileApps?`$filter=displayName eq '$dn'" -Headers $headers
-$existingApp = $existing.value | Where-Object { $_.displayName -eq $appName } | Select-Object -First 1
-
-if ($existingApp) {
-    Write-Host "Found: $($existingApp.id)  v$($existingApp.displayVersion)"
-    if ($existingApp.displayVersion -eq $appVersion -and -not $forceUpdate) {
-        Write-Host "Same version deployed. Skipping."
-        exit 0
-    }
-    $appId = $existingApp.id
-} else {
-    Write-Host "Not found - creating new."
-    $appId = $null
-}
+# ── 5. Create or update app shell ─────────────────────────────────────────────
 
 Write-Host "--- 5. Create / update app shell ---"
 
@@ -191,12 +197,14 @@ $appBody = @{
 
 if ($appId) {
     Invoke-GraphJson -Method PATCH -Uri "$base/deviceAppManagement/mobileApps/$appId" -Headers $headers -Body $appBody
-    Write-Host "App updated: $appId"
+    Write-Host "App metadata updated: $appId"
 } else {
     $newApp = Invoke-GraphJson -Method POST -Uri "$base/deviceAppManagement/mobileApps" -Headers $headers -Body $appBody
     $appId  = $newApp.id
     Write-Host "App created: $appId"
 }
+
+# ── 6. Upload content ─────────────────────────────────────────────────────────
 
 Write-Host "--- 6. Upload content ---"
 
@@ -221,17 +229,14 @@ Write-Host "File entry: $fileId"
 Write-Host "Waiting for SAS URI..."
 $waited = 0
 do {
-    Start-Sleep -Seconds 3
-    $waited += 3
+    Start-Sleep -Seconds 3; $waited += 3
     $fileEntry = Invoke-GraphJson -Method GET `
         -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId" `
         -Headers $headers
     Write-Host "State: $($fileEntry.uploadState)"
 } while (-not $fileEntry.azureStorageUri -and $waited -lt 60)
 
-if (-not $fileEntry.azureStorageUri) {
-    Write-Error "No SAS URI received"; exit 1
-}
+if (-not $fileEntry.azureStorageUri) { Write-Error "No SAS URI received"; exit 1 }
 
 Write-Host "Uploading via block blob chunks..."
 Upload-AzureBlob -SasUri $fileEntry.azureStorageUri -Bytes $encBytes
@@ -257,16 +262,15 @@ Invoke-GraphJson -Method POST `
 Write-Host "Waiting for commit..."
 $waited = 0
 do {
-    Start-Sleep -Seconds 5
-    $waited += 5
+    Start-Sleep -Seconds 5; $waited += 5
     $fileEntry = Invoke-GraphJson -Method GET `
         -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId" `
         -Headers $headers
-    Write-Host "Upload state: $($fileEntry.uploadState) (MAC match was: $macMatch)"
+    Write-Host "Upload state: $($fileEntry.uploadState)"
 } while ($fileEntry.uploadState -notmatch "commitFile" -and $waited -lt 120)
 
 if ($fileEntry.uploadState -eq "commitFileFailed") {
-    Write-Error "File commit failed. MAC match: $macMatch"
+    Write-Error "File commit failed."
     exit 1
 }
 
@@ -275,6 +279,8 @@ Invoke-GraphJson -Method PATCH -Uri "$base/deviceAppManagement/mobileApps/$appId
     committedContentVersion = $cvId
 }
 Write-Host "Content version committed"
+
+# ── 7. Assign to All Devices ──────────────────────────────────────────────────
 
 Write-Host "--- 7. Assign to All Devices ---"
 
@@ -296,9 +302,14 @@ Invoke-GraphJson -Method POST `
 
 Write-Host "Assigned to All Devices (Required)"
 
-Write-Host "DEPLOYMENT COMPLETE"
-Write-Host "App       : $appName"
-Write-Host "Version   : $appVersion"
-Write-Host "Intune ID : $appId"
-Write-Host "Auth      : OIDC"
-Write-Host "Assignment: All Devices - Required"
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+Write-Host ""
+Write-Host "=========================================="
+Write-Host "  DEPLOYMENT COMPLETE"
+Write-Host "  App       : $appName"
+Write-Host "  Version   : $appVersion"
+Write-Host "  Intune ID : $appId"
+Write-Host "  Auth      : OIDC"
+Write-Host "  Assignment: All Devices - Required"
+Write-Host "=========================================="
