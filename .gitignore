@@ -1,0 +1,21 @@
+# Build outputs
+output/
+*.intunewin
+IntuneWinAppUtil.exe
+
+# Logs
+*.log
+logs/
+
+# Never commit secrets
+*.pfx
+*.p12
+secrets.json
+.env
+
+# PowerShell
+*.ps1xml
+
+# OS
+.DS_Store
+Thumbs.db
