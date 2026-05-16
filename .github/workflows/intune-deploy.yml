@@ -20,9 +20,6 @@ env:
   OUTPUT_DIR: "output"
 
 jobs:
-  # ──────────────────────────────────────────────
-  # JOB 1 — Read config & extract version
-  # ──────────────────────────────────────────────
   prepare:
     name: 📋 Read Config & Detect Version
     runs-on: windows-latest
@@ -57,15 +54,12 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          $version = .\scripts\Get-InstallerVersion.ps1 `
+          $version = (.\scripts\Get-InstallerVersion.ps1 `
             -InstallerPath "app\${{ steps.cfg.outputs.setup_file }}" `
-            -InstallerType "${{ steps.cfg.outputs.installer_type }}"
-          Write-Host "✅ Detected version: $version"
+            -InstallerType "${{ steps.cfg.outputs.installer_type }}").Trim()
+          Write-Host "Detected version: $version"
           "app_version=$version" >> $env:GITHUB_OUTPUT
 
-  # ──────────────────────────────────────────────
-  # JOB 2 — Build .intunewin package
-  # ──────────────────────────────────────────────
   build:
     name: 📦 Build .intunewin
     runs-on: windows-latest
@@ -78,23 +72,16 @@ jobs:
       - name: Download IntuneWinAppUtil.exe
         shell: pwsh
         run: |
-          Write-Host "⬇️  Downloading IntuneWinAppUtil..."
-          Invoke-WebRequest -Uri $env:INTUNEWINAPPUTIL_URL `
-            -OutFile "IntuneWinAppUtil.exe" -UseBasicParsing
-          Write-Host "✅ Tool ready"
+          Invoke-WebRequest -Uri $env:INTUNEWINAPPUTIL_URL -OutFile "IntuneWinAppUtil.exe" -UseBasicParsing
 
       - name: Build .intunewin
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path $env:OUTPUT_DIR -Force | Out-Null
-          .\IntuneWinAppUtil.exe `
-            -c app `
-            -s "${{ needs.prepare.outputs.setup_file }}" `
-            -o $env:OUTPUT_DIR `
-            -q
+          .\IntuneWinAppUtil.exe -c app -s "${{ needs.prepare.outputs.setup_file }}" -o $env:OUTPUT_DIR -q
           $pkg = Get-ChildItem -Path $env:OUTPUT_DIR -Filter "*.intunewin" | Select-Object -First 1
-          if (-not $pkg) { throw "❌ .intunewin not created!" }
-          Write-Host "✅ Package: $($pkg.Name) ($([math]::Round($pkg.Length/1MB,2)) MB)"
+          if (-not $pkg) { throw "Package not created!" }
+          Write-Host "Package: $($pkg.Name) ($([math]::Round($pkg.Length/1MB,2)) MB)"
 
       - name: Upload .intunewin artifact
         uses: actions/upload-artifact@v4
@@ -104,15 +91,11 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-  # ──────────────────────────────────────────────
-  # JOB 3 — Deploy to Intune via OIDC (no secret)
-  # ──────────────────────────────────────────────
   deploy:
     name: 🚢 Deploy to Intune (OIDC)
     runs-on: windows-latest
     needs: [prepare, build]
 
-    # ⬇️  OIDC requires these two permissions — same as your primaryuser workflow
     permissions:
       id-token: write
       contents: read
@@ -127,35 +110,33 @@ jobs:
           name: intunewin-${{ needs.prepare.outputs.app_name }}-v${{ needs.prepare.outputs.app_version }}-run${{ github.run_number }}
           path: output
 
-      # ── OIDC login — same action your primaryuser workflow uses ──────────────
-      - name: Login to Azure (OIDC — no secret)
+      - name: Login to Azure (OIDC)
         uses: azure/login@v2
         with:
           client-id:  ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id:  ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true   # no Azure sub needed, Graph only
-          enable-AzPSSession: true       # enables Get-AzAccessToken in pwsh
+          allow-no-subscriptions: true
+          enable-AzPSSession: true
 
-      # ── Deploy using azure/powershell so Az context is inherited ────────────
       - name: Deploy to Intune
         uses: azure/powershell@v2
         with:
           azPSVersion: latest
           inlineScript: |
-            $pkg = Get-ChildItem -Path output -Filter "*.intunewin" | Select-Object -First 1
+            $config        = Get-Content "app-config.json" | ConvertFrom-Json
+            $pkg           = Get-ChildItem -Path output -Filter "*.intunewin" | Select-Object -First 1
+            $version       = (.\scripts\Get-InstallerVersion.ps1 -InstallerPath "app\$($config.setupFile)" -InstallerType $config.installerType).Trim()
             $env:INTUNEWIN_PATH  = $pkg.FullName
-            $env:APP_NAME        = "${{ needs.prepare.outputs.app_name }}"
-            $env:APP_VERSION     = "${{ needs.prepare.outputs.app_version }}"
-            $env:APP_PUBLISHER   = "${{ needs.prepare.outputs.publisher }}"
-            $env:APP_DESC        = "${{ needs.prepare.outputs.description }}"
-            $env:INSTALL_CMD     = "${{ needs.prepare.outputs.install_cmd }}"
-            $env:UNINSTALL_CMD   = "${{ needs.prepare.outputs.uninstall_cmd }}"
+            $env:APP_NAME        = $config.displayName
+            $env:APP_VERSION     = $version
+            $env:APP_PUBLISHER   = $config.publisher
+            $env:APP_DESC        = $config.description
+            $env:INSTALL_CMD     = $config.installCommand
+            $env:UNINSTALL_CMD   = $config.uninstallCommand
             $env:FORCE_UPDATE    = "${{ github.event.inputs.force_update || 'false' }}"
+            Write-Host "Deploying: $env:APP_NAME v$env:APP_VERSION"
             .\scripts\Deploy-IntuneApp.ps1
 
-  # ──────────────────────────────────────────────
-  # JOB 4 — GitHub Release (audit trail)
-  # ──────────────────────────────────────────────
   release:
     name: 🏷️ Create GitHub Release
     runs-on: ubuntu-latest
@@ -179,27 +160,16 @@ jobs:
           tag_name: "v${{ needs.prepare.outputs.app_version }}-${{ github.run_number }}"
           name: "${{ needs.prepare.outputs.app_name }} — v${{ needs.prepare.outputs.app_version }} (#${{ github.run_number }})"
           body: |
-            ## 📦 Deployment Summary
-
-            | Field         | Value |
-            |---------------|-------|
-            | **App**       | ${{ needs.prepare.outputs.app_name }} |
-            | **Version**   | ${{ needs.prepare.outputs.app_version }} |
-            | **Publisher** | ${{ needs.prepare.outputs.publisher }} |
-            | **Assigned**  | All Devices (Required) |
-            | **Auth**      | OIDC — no secrets stored |
-            | **Run**       | #${{ github.run_number }} |
-            | **Commit**    | `${{ github.sha }}` |
-            | **Actor**     | `${{ github.actor }}` |
-
-            ## 🔗 Links
-            - [Workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            - [Commit diff](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})
-
-            ---
-            *Deployed via GitHub Actions OIDC → Microsoft Intune Graph API*
+            ## Deployment Summary
+            | Field | Value |
+            |---|---|
+            | **App** | ${{ needs.prepare.outputs.app_name }} |
+            | **Version** | ${{ needs.prepare.outputs.app_version }} |
+            | **Assigned** | All Devices (Required) |
+            | **Auth** | OIDC |
+            | **Run** | #${{ github.run_number }} |
+            | **Commit** | `${{ github.sha }}` |
           files: output/*.intunewin
-          generate_release_notes: false
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
