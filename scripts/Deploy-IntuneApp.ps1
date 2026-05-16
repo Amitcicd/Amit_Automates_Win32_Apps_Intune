@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 
 Write-Host "--- 0. Bootstrap ---"
 
-$requiredEnv = @("APP_NAME","APP_VERSION","INSTALL_CMD","UNUNINSTALL_CMD","INTUNEWIN_PATH")
+$requiredEnv = @("APP_NAME","APP_VERSION","INSTALL_CMD","UNINSTALL_CMD","INTUNEWIN_PATH")
 foreach ($v in $requiredEnv) {
     if ([string]::IsNullOrWhiteSpace([System.Environment]::GetEnvironmentVariable($v))) {
         Write-Error "Missing required environment variable: $v"; exit 1
@@ -24,8 +24,6 @@ Write-Host "Package : $pkgPath ($([math]::Round((Get-Item $pkgPath).Length/1MB,2
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# ── Helper: Graph API calls (same pattern as working intune-auto-syn script) ──
-
 function Invoke-GraphJson {
     param(
         [ValidateSet('GET','POST','PATCH','DELETE')] [string] $Method,
@@ -44,39 +42,44 @@ function Invoke-GraphJson {
     }
 }
 
-# ── Helper: Azure Blob chunked upload ─────────────────────────────────────────
-
 function Upload-AzureBlob {
     param([string]$SasUri, [byte[]]$Bytes)
+
     $chunkSize = 4 * 1024 * 1024
     $blockIds  = New-Object System.Collections.Generic.List[string]
     $offset    = 0
     $chunkNum  = 0
+
     while ($offset -lt $Bytes.Length) {
         $length = [Math]::Min($chunkSize, $Bytes.Length - $offset)
         $chunk  = New-Object byte[] $length
         [Array]::Copy($Bytes, $offset, $chunk, 0, $length)
+
         $blockId = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($chunkNum.ToString("D6")))
         $blockIds.Add($blockId)
+
         $blockUri = "$SasUri&comp=block&blockid=$([Uri]::EscapeDataString($blockId))"
+
         Invoke-RestMethod -Method Put -Uri $blockUri -Body $chunk -Headers @{
             "x-ms-blob-type" = "BlockBlob"
             "Content-Type"   = "application/octet-stream"
         } | Out-Null
+
         Write-Host "  Chunk $chunkNum uploaded ($length bytes)"
         $offset += $length
         $chunkNum++
     }
+
     $blockListXml = "<?xml version=`"1.0`" encoding=`"utf-8`"?><BlockList>" +
         (($blockIds | ForEach-Object { "<Latest>$_</Latest>" }) -join "") +
         "</BlockList>"
+
     Invoke-RestMethod -Method Put -Uri "$SasUri&comp=blocklist" -Body ([Text.Encoding]::UTF8.GetBytes($blockListXml)) -Headers @{
         "Content-Type" = "application/xml"
     } | Out-Null
+
     Write-Host "Block list committed ($chunkNum chunks)"
 }
-
-# ── 1. Authenticate via OIDC ──────────────────────────────────────────────────
 
 Write-Host "--- 1. Authenticate (OIDC) ---"
 
@@ -88,8 +91,6 @@ $headers = @{ Authorization = "Bearer $plainToken" }
 $base    = "https://graph.microsoft.com/beta"
 Write-Host "Auth token acquired (expires: $($tokenObj.ExpiresOn))"
 
-# ── 2. Read .intunewin metadata ───────────────────────────────────────────────
-
 Write-Host "--- 2. Read .intunewin metadata ---"
 
 $configRaw = Get-Content "app-config.json" | ConvertFrom-Json
@@ -100,6 +101,7 @@ $xmlEntry = $zip.Entries | Where-Object { $_.Name -ieq "Detection.xml" } | Selec
 if (-not $xmlEntry) {
     Write-Error "Detection.xml not found in $pkgPath"; exit 1
 }
+
 $reader   = New-Object System.IO.StreamReader($xmlEntry.Open())
 $xml      = [xml]$reader.ReadToEnd()
 $reader.Close()
@@ -118,8 +120,6 @@ Write-Host "IV len           : $($enc.InitializationVector.Trim().Length)"
 Write-Host "Mac len          : $($enc.Mac.Trim().Length)"
 Write-Host "FileDigest len   : $($enc.FileDigest.Trim().Length)"
 
-# ── 3. Read encrypted bytes ───────────────────────────────────────────────────
-
 Write-Host "--- 3. Read encrypted bytes ---"
 
 $zip2      = [System.IO.Compression.ZipFile]::OpenRead($pkgPath)
@@ -127,6 +127,7 @@ $encEntry  = $zip2.Entries | Where-Object { $_.Name -ieq "IntunePackage.intunewi
 if (-not $encEntry) {
     Write-Error "IntunePackage.intunewin not found in $pkgPath"; exit 1
 }
+
 $encStream = $encEntry.Open()
 $ms        = New-Object System.IO.MemoryStream
 $encStream.CopyTo($ms)
@@ -134,16 +135,14 @@ $encBytes  = $ms.ToArray()
 $ms.Dispose()
 $encStream.Close()
 $zip2.Dispose()
+
 $encryptedSize = $encBytes.Length
 Write-Host "Encrypted bytes: $encryptedSize"
 
-# Verify MAC matches first 32 bytes of encrypted file
 $macFromXml = [Convert]::FromBase64String($enc.Mac.Trim())
 $first32    = $encBytes[0..31]
 $macMatch   = -not (Compare-Object $macFromXml $first32)
 Write-Host "MAC matches file header: $macMatch"
-
-# ── 4. Check existing app ─────────────────────────────────────────────────────
 
 Write-Host "--- 4. Check existing app ---"
 
@@ -163,8 +162,6 @@ if ($existingApp) {
     $appId = $null
 }
 
-# ── 5. Create / update app shell ──────────────────────────────────────────────
-
 Write-Host "--- 5. Create / update app shell ---"
 
 $detectionRules = @()
@@ -178,17 +175,17 @@ if ($configRaw.detectionRule.type -eq "msi") {
 }
 
 $appBody = @{
-    "@odata.type"        = "#microsoft.graph.win32LobApp"
-    displayName          = $appName
-    displayVersion       = $appVersion
-    description          = $description
-    publisher            = $publisher
-    fileName             = $setupFilePath
-    setupFilePath        = $setupFilePath
-    installCommandLine   = $installCmd
-    uninstallCommandLine = $uninstallCmd
-    installExperience    = @{ runAsAccount = "system"; deviceRestartBehavior = "suppress" }
-    detectionRules       = $detectionRules
+    "@odata.type"                  = "#microsoft.graph.win32LobApp"
+    displayName                    = $appName
+    displayVersion                 = $appVersion
+    description                    = $description
+    publisher                      = $publisher
+    fileName                       = $setupFilePath
+    setupFilePath                  = $setupFilePath
+    installCommandLine             = $installCmd
+    uninstallCommandLine           = $uninstallCmd
+    installExperience              = @{ runAsAccount = "system"; deviceRestartBehavior = "suppress" }
+    detectionRules                 = $detectionRules
     minimumSupportedWindowsRelease = "1903"
 }
 
@@ -200,8 +197,6 @@ if ($appId) {
     $appId  = $newApp.id
     Write-Host "App created: $appId"
 }
-
-# ── 6. Upload content ─────────────────────────────────────────────────────────
 
 Write-Host "--- 6. Upload content ---"
 
@@ -226,7 +221,8 @@ Write-Host "File entry: $fileId"
 Write-Host "Waiting for SAS URI..."
 $waited = 0
 do {
-    Start-Sleep -Seconds 3; $waited += 3
+    Start-Sleep -Seconds 3
+    $waited += 3
     $fileEntry = Invoke-GraphJson -Method GET `
         -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId" `
         -Headers $headers
@@ -239,8 +235,6 @@ if (-not $fileEntry.azureStorageUri) {
 
 Write-Host "Uploading via block blob chunks..."
 Upload-AzureBlob -SasUri $fileEntry.azureStorageUri -Bytes $encBytes
-
-# ── Commit file ───────────────────────────────────────────────────────────────
 
 Write-Host "Committing file encryption info..."
 $commitBody = @{
@@ -263,7 +257,8 @@ Invoke-GraphJson -Method POST `
 Write-Host "Waiting for commit..."
 $waited = 0
 do {
-    Start-Sleep -Seconds 5; $waited += 5
+    Start-Sleep -Seconds 5
+    $waited += 5
     $fileEntry = Invoke-GraphJson -Method GET `
         -Uri "$base/deviceAppManagement/mobileApps/$appId/microsoft.graph.win32LobApp/contentVersions/$cvId/files/$fileId" `
         -Headers $headers
@@ -280,8 +275,6 @@ Invoke-GraphJson -Method PATCH -Uri "$base/deviceAppManagement/mobileApps/$appId
     committedContentVersion = $cvId
 }
 Write-Host "Content version committed"
-
-# ── 7. Assign to All Devices ──────────────────────────────────────────────────
 
 Write-Host "--- 7. Assign to All Devices ---"
 
@@ -300,6 +293,7 @@ Invoke-GraphJson -Method POST `
             }
         })
     }
+
 Write-Host "Assigned to All Devices (Required)"
 
 Write-Host "DEPLOYMENT COMPLETE"
