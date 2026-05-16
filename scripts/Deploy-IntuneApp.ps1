@@ -32,14 +32,12 @@ Write-Host "Force Update: $forceUpdate"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-foreach ($mod in @("IntuneWin32App","Microsoft.Graph.Authentication")) {
-    if (-not (Get-Module -ListAvailable -Name $mod)) {
-        Write-Host "Installing module: $mod"
-        Install-Module -Name $mod -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
-    }
+# Pin to 1.2.1 which uses global auth header
+if (-not (Get-Module -ListAvailable -Name IntuneWin32App | Where-Object Version -eq "1.2.1")) {
+    Write-Host "Installing IntuneWin32App 1.2.1"
+    Install-Module -Name IntuneWin32App -RequiredVersion 1.2.1 -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
 }
-Import-Module IntuneWin32App -Force
-Import-Module Microsoft.Graph.Authentication -Force
+Import-Module IntuneWin32App -RequiredVersion 1.2.1 -Force
 
 Write-Host "--- 1. Authenticate (OIDC) ---"
 
@@ -52,22 +50,17 @@ catch {
     exit 1
 }
 
-# Convert SecureString to plain text
 $plainToken = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
     [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenObj.Token)
 )
 
-# Connect Microsoft.Graph for Invoke-MgGraphRequest
-Connect-MgGraph -AccessToken $tokenObj.Token -NoWelcome
-Write-Host "Connected to Microsoft Graph"
-
-# Set global auth header for IntuneWin32App module (bypasses Connect-MSIntuneGraph)
+# Set global auth header — required by IntuneWin32App 1.2.1
 $global:AuthenticationHeader = @{
-    "Content-Type" = "application/json"
+    "Content-Type"  = "application/json"
     "Authorization" = "Bearer $plainToken"
-    "ExpiresOn"    = $tokenObj.ExpiresOn.ToString()
+    "ExpiresOn"     = $tokenObj.ExpiresOn.ToString()
 }
-Write-Host "IntuneWin32App auth header set"
+Write-Host "Auth header set (token expires: $($tokenObj.ExpiresOn))"
 
 Write-Host "--- 2. Check existing app ---"
 
@@ -93,14 +86,13 @@ $detectCfg = $configRaw.detectionRule
 
 $detectionRule = switch ($detectCfg.type) {
     "msi" {
-        Write-Host "Detection: MSI product code $($detectCfg.productCode)"
+        Write-Host "Detection: MSI $($detectCfg.productCode)"
         New-IntuneWin32AppDetectionRuleMSI `
             -ProductCode            $detectCfg.productCode `
             -ProductVersionOperator "greaterThanOrEqual" `
             -ProductVersion         $appVersion
     }
     "registry" {
-        Write-Host "Detection: Registry $($detectCfg.keyPath)"
         New-IntuneWin32AppDetectionRuleRegistry `
             -KeyPath       $detectCfg.keyPath `
             -ValueName     $detectCfg.valueName `
@@ -109,15 +101,10 @@ $detectionRule = switch ($detectCfg.type) {
             -Value         $appVersion
     }
     "file" {
-        Write-Host "Detection: File $($detectCfg.path)"
         New-IntuneWin32AppDetectionRuleFile `
             -Path             $detectCfg.path `
             -FileOrFolderName $detectCfg.fileOrFolder `
             -DetectionType    "exists"
-    }
-    default {
-        Write-Error "Unknown detectionRule.type: $($detectCfg.type)"
-        exit 1
     }
 }
 
@@ -129,7 +116,6 @@ $osVersionMap = @{
     "W11-21H2" = "10.0.22000"; "W11-22H2" = "10.0.22621"; "W11-23H2" = "10.0.22631"
 }
 $minOs = if ($osVersionMap.ContainsKey($req.minimumOS)) { $osVersionMap[$req.minimumOS] } else { $req.minimumOS }
-Write-Host "Min OS: $minOs  Arch: $($req.architecture)"
 
 $reqRules = @(
     New-IntuneWin32AppRequirementRuleOperatingSystem `
@@ -152,11 +138,11 @@ if ($existingApp) {
         uninstallCommandLine = $uninstallCmd
     } | ConvertTo-Json -Depth 5
 
-    Invoke-MgGraphRequest `
-        -Method      PATCH `
-        -Uri         "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($existingApp.id)" `
-        -Body        $patchBody `
-        -ContentType "application/json"
+    Invoke-RestMethod `
+        -Method  PATCH `
+        -Uri     "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps/$($existingApp.id)" `
+        -Headers $global:AuthenticationHeader `
+        -Body    $patchBody
     Write-Host "Metadata updated"
 
     Update-IntuneWin32AppPackageFile -ID $existingApp.id -FilePath $pkgPath
@@ -191,7 +177,7 @@ $assignments   = Get-IntuneWin32AppAssignment -ID $appId -ErrorAction SilentlyCo
 $hasAllDevices = $assignments | Where-Object { $_.target.'@odata.type' -match 'allDevices' }
 
 if ($hasAllDevices -and -not $forceUpdate) {
-    Write-Host "All Devices assignment already present. Skipping."
+    Write-Host "All Devices assignment already present."
 } else {
     Add-IntuneWin32AppAssignment `
         -ID           $appId `
@@ -205,5 +191,4 @@ Write-Host "DEPLOYMENT COMPLETE"
 Write-Host "App       : $appName"
 Write-Host "Version   : $appVersion"
 Write-Host "Intune ID : $appId"
-Write-Host "Auth      : OIDC"
 Write-Host "Assignment: All Devices - Required"
